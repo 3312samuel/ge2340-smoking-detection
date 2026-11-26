@@ -1,0 +1,18 @@
+# Large / downloaded weights
+models/sam3.pt
+*.safetensors
+yolo26n.pt
+yolo26n-pose.pt
+
+# Recorded clips contain group members' faces: keep them OFF the public repo
+data/clips/
+*.mp4
+*.mov
+results/crops/
+
+# Training runs and local caches
+runs/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+.env

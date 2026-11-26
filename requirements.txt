@@ -1,0 +1,8 @@
+ultralytics>=8.4.0
+opencv-python
+numpy
+pandas
+matplotlib
+huggingface_hub
+roboflow            # only for scripts/train_cigarette_detector.py
+# SAM 3 (Meta) is installed separately, see README "Setup on Colab".
