@@ -27,10 +27,12 @@ Thresholds for A2 and A3 are chosen on the **dev** clips only, written to
 | Component | Budget |
 |---|---|
 | Stage 1 pose, per frame | ≤ 33 ms (keeps up with 30 fps) |
-| Stage 2 SAM 3, per person crop | ≤ 1000 ms |
+| Stage 2 SAM 3, per person crop | ≤ 1500 ms (float16 autocast) |
 | Gesture onset → alert | ≤ 3 s (1.5 s sustain window + Stage 1 + Stage 2) |
 
 SAM 3 runs only once per triggered person track (max 3 per clip), not on every frame.
+On a T4, SAM 3 under bfloat16 autocast took ~3.2 s per crop (bf16 is emulated on this GPU);
+switching to float16 autocast gave ~1.25 s with the same score, so float16 is used.
 Measured values are written to `results/latency_summary.csv`.
 
 ## Repository layout

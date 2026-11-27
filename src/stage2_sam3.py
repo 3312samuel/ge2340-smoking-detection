@@ -5,9 +5,11 @@ internal confidence filter (default 0.5) is set to 0 so we always get the raw
 best score; the decision threshold is chosen on the dev split and then frozen
 (see analyze.py), instead of relying on the library default.
 
-Inference runs under CUDA autocast in bfloat16, as in Meta's official SAM 3
-examples: parts of the model produce bfloat16 activations, and running without
-autocast raises "mat1 and mat2 must have the same dtype (BFloat16 and Float)".
+Inference runs under CUDA autocast (without it SAM 3 raises "mat1 and mat2
+must have the same dtype"). Meta's examples use bfloat16, but the Tesla T4 has
+no native bfloat16 support: on T4 we measured ~3.2 s per crop with bfloat16 and
+~1.25 s with float16, with the same score (0.94 vs 0.94) on a test image.
+float16 is therefore the default; pass amp_dtype=torch.bfloat16 on Ampere+ GPUs.
 """
 import numpy as np
 import torch
@@ -15,13 +17,13 @@ from PIL import Image
 
 
 class Sam3Verifier:
-    def __init__(self, checkpoint, prompt="cigarette", device=None, amp_dtype=torch.bfloat16):
+    def __init__(self, checkpoint, prompt="cigarette", device=None, amp_dtype=torch.float16):
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.prompt = prompt
-        self.amp_dtype = amp_dtype  # set to torch.float16 if bfloat16 fails on your GPU
+        self.amp_dtype = amp_dtype
         model = build_sam3_image_model(checkpoint_path=checkpoint,
                                        device=self.device, load_from_HF=False)
         self.processor = Sam3Processor(model, device=self.device,
