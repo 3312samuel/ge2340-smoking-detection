@@ -43,6 +43,8 @@ src/stage1_pose.py      Stage 1: pose screening rule + ByteTrack sustain counter
 src/stage2_sam3.py      Stage 2: SAM 3 text-prompt verification
 src/run_eval.py         one GPU pass over all clips -> results/raw_scores.csv
 src/analyze.py          dev threshold selection (--freeze), then test tables + figures
+src/image_eval.py       image-level recall by cigarette size on Roboflow validation images
+scripts/make_labels.py  builds data/labels.csv from clip file names
 scripts/train_cigarette_detector.py   training script for the A2 baseline
 notebooks/colab_eval.ipynb            end-to-end Colab notebook (T4)
 data/labels.csv         shot list + clip-level ground truth (clips themselves kept private)
