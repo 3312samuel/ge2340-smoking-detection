@@ -110,6 +110,7 @@ def main():
     with open(args.labels, newline="") as f:
         rows = [r for r in csv.DictReader(f) if r.get("file")]
 
+    print(f"{len(rows)} clips in {args.labels}; loading models...", flush=True)
     pose = PoseScreener(args.pose, dist_thr=args.dist_thr, sustain=args.sustain,
                         device=args.device)
     detector = YOLO(args.detector) if args.detector else None
@@ -117,6 +118,7 @@ def main():
     if args.sam3:
         from stage2_sam3 import Sam3Verifier
         sam3 = Sam3Verifier(args.sam3, prompt="cigarette")
+    print("Models loaded. Processing clips...", flush=True)
 
     crop_dir = None
     if args.save_crops:
@@ -130,7 +132,7 @@ def main():
         for i, row in enumerate(rows, 1):
             path = Path(args.clips) / row["file"]
             if not path.exists():
-                print(f"[skip] missing {path}")
+                print(f"[skip] missing {path}", flush=True)
                 continue
             t0 = time.time()
             res = evaluate_clip(path, pose, sam3, detector, args, crop_dir)
@@ -141,7 +143,7 @@ def main():
             f.flush()
             print(f"[{i}/{len(rows)}] {row['file']}: pose={res['pose_triggered']} "
                   f"sam3={res['sam3_max_score']:.2f} det={res['det_max_conf']:.2f} "
-                  f"({time.time() - t0:.1f}s)")
+                  f"({time.time() - t0:.1f}s)", flush=True)
     print(f"Saved {args.out}")
 
 
