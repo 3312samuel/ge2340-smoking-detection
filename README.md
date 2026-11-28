@@ -3,8 +3,8 @@
 Two-stage computer-vision pipeline that flags *suspected* smoking in camera footage:
 
 ```
-video frame ──► Stage 1: YOLO26n-pose + hand-to-mouth rule ──► person crop (+30% pad)
-                (every 5th frame, sustained 9 inferences ≈ 1.5 s)          │
+video frame ──► Stage 1: YOLO26n-pose, hand-to-mouth ratio ──► person crop (+30% pad)
+                (every 5th frame; ratio < dev-tuned threshold for ≥ 1 s) │
                                                                            ▼
                                    alert ◄── score ≥ frozen threshold ◄── Stage 2: SAM 3, prompt "cigarette"
 ```
@@ -15,11 +15,12 @@ No face recognition or identification is performed; output is an alert with a co
 
 | ID | Approach | Decision rule |
 |---|---|---|
-| A1 | Pose only | sustained hand-to-mouth gesture |
+| A1 | Pose only | sustained hand-to-mouth gesture (nose–wrist distance / nose–shoulder distance) |
 | A2 | Object detection only | our YOLO26n cigarette detector, max confidence ≥ threshold |
 | A3 | **Pose + SAM 3 (proposed)** | A1 **and** SAM 3 "cigarette" score on the person crop ≥ threshold |
 
-Thresholds for A2 and A3 are chosen on the **dev** clips only, written to
+The Stage-1 ratio threshold (smallest value that flags every dev smoking clip) and the A2/A3
+score thresholds (best dev F1) are chosen on the **dev** clips only, written to
 `results/frozen_thresholds.json`, and then left unchanged for the test clips.
 
 ## GPU latency budget (Tesla T4)
@@ -28,9 +29,9 @@ Thresholds for A2 and A3 are chosen on the **dev** clips only, written to
 |---|---|
 | Stage 1 pose, per frame | ≤ 33 ms (keeps up with 30 fps) |
 | Stage 2 SAM 3, per person crop | ≤ 1500 ms (float16 autocast) |
-| Gesture onset → alert | ≤ 3 s (1.5 s sustain window + Stage 1 + Stage 2) |
+| Gesture onset → alert | ≤ 3 s (1.0 s sustain window + Stage 1 + Stage 2) |
 
-SAM 3 runs only once per triggered person track (max 3 per clip), not on every frame.
+SAM 3 runs once per triggered clip, on the crop where the hand is closest to the mouth, not on every frame.
 On a T4, SAM 3 under bfloat16 autocast took ~3.2 s per crop (bf16 is emulated on this GPU);
 switching to float16 autocast gave ~1.25 s with the same score, so float16 is used.
 Measured values are written to `results/latency_summary.csv`.

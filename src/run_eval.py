@@ -1,20 +1,24 @@
 """Run all three approaches on every labelled clip and log raw scores.
 
-One GPU pass produces results/raw_scores.csv. Thresholds are NOT applied here;
-analyze.py picks them on the dev split, freezes them, then scores the test split.
+One GPU pass produces
+  results/raw_scores.csv  one row per clip (scores + latency)
+  results/pose_seqs.json  per-frame hand-to-mouth ratio for every tracked person
+No decision thresholds are applied here: analyze.py chooses them on the dev
+split, freezes them, then scores the test split.
 
-Per clip we log:
-  A1 pose-only      : did any track satisfy the sustained hand-to-mouth rule?
-  A2 detector-only  : max cigarette confidence of our YOLO26n detector over frames
-  A3 pose + SAM 3   : max SAM 3 "cigarette" score over crops of triggered tracks
-plus per-stage latency (ms, GPU-synchronised).
+Per clip:
+  Stage 1 : YOLO26n-pose on every `stride`-th frame -> hand-to-mouth ratio per person
+  Stage 2 : SAM 3 "cigarette" score on the person crop at the frame with the
+            smallest ratio (the moment the hand is closest to the mouth)
+  A2      : max confidence of our YOLO26n cigarette detector over the same frames
+A1 = Stage 1 sustained trigger; A3 = A1 and Stage-2 score >= threshold.
 
 Usage (Colab):
-  python src/run_eval.py --labels data/labels.csv --clips data/clips \
-      --sam3 models/sam3.pt --detector models/cigarette_yolo26n_ge2340.pt
+  python -u src/run_eval.py --labels data/labels.csv --clips /content/drive/MyDrive/ge2340/clips
 """
 import argparse
 import csv
+import json
 import sys
 import time
 from pathlib import Path
@@ -28,67 +32,63 @@ from stage1_pose import PoseScreener  # noqa: E402
 
 FIELDS = [
     "file", "person", "gesture", "distance", "is_smoking", "split", "n_frames",
-    "pose_triggered", "pose_first_trigger_s", "n_sam3_calls", "sam3_max_score",
+    "min_ratio", "best_frame_s", "n_sam3_calls", "sam3_score",
     "det_max_conf", "det_frames_hit",
-    "stage1_ms_mean", "stage1_ms_p95", "sam3_ms_mean", "sam3_ms_p95",
-    "det_ms_mean", "det_ms_p95",
+    "stage1_ms_mean", "stage1_ms_p95", "sam3_ms_mean", "det_ms_mean", "det_ms_p95",
 ]
 
 
 def evaluate_clip(path, pose, sam3, detector, args, crop_dir=None):
     pose.reset()
-    lat = {}
-    pose_trig, first_t = False, ""
-    sam3_scores, verified_tracks = [], set()
+    lat, seqs = {}, {}
+    best = None  # (ratio, t, crop)
     det_max, det_hits, n = 0.0, 0, 0
 
-    for fidx, t, frame in iter_frames(path, args.stride):
+    for k, (fidx, t, frame) in enumerate(iter_frames(path, args.stride)):
         n += 1
         with timer(lat, "stage1"):
             people = pose.step(frame)
-
         for p in people:
-            if not p["triggered"]:
-                continue
-            if not pose_trig:
-                pose_trig, first_t = True, round(t, 2)
-            # Stage 2 runs once per triggered track,
-            # capped per clip to bound GPU cost.
-            if (sam3 is not None and p["track_id"] not in verified_tracks
-                    and len(verified_tracks) < args.max_sam3_calls):
+            r = p["ratio"]
+            seqs.setdefault(str(p["track_id"]), []).append(
+                [k, round(t, 3), None if r is None else round(r, 4)])
+            if r is not None and (best is None or r < best[0]):
                 crop = crop_person(frame, p["box"], pad=0.3)
-                if crop is None:
-                    continue
-                with timer(lat, "sam3"):
-                    s, _ = sam3.score(crop)
-                sam3_scores.append(s)
-                verified_tracks.add(p["track_id"])
-                if crop_dir is not None:
-                    cv2.imwrite(str(crop_dir / f"{Path(path).stem}_t{p['track_id']}_{s:.2f}.jpg"), crop)
+                if crop is not None:
+                    best = (r, t, crop)
 
         if detector is not None:
             with timer(lat, "det"):
-                r = detector(frame, conf=0.01, imgsz=640, device=args.device, verbose=False)[0]
-            if r.boxes is not None and len(r.boxes):
-                c = float(r.boxes.conf.max())
+                res = detector(frame, conf=0.01, imgsz=640, device=args.device, verbose=False)[0]
+            if res.boxes is not None and len(res.boxes):
+                c = float(res.boxes.conf.max())
                 det_max = max(det_max, c)
                 det_hits += int(c >= 0.25)
 
+    sam3_score, calls = 0.0, 0
+    if sam3 is not None and best is not None:
+        with timer(lat, "sam3"):
+            sam3_score, _ = sam3.score(best[2])
+        calls = 1
+        if crop_dir is not None:
+            cv2.imwrite(str(crop_dir / f"{Path(path).stem}_r{best[0]:.2f}_s{sam3_score:.2f}.jpg"), best[2])
+
     s1, s1p = summarise_ms(lat.get("stage1", [])[1:])  # drop warm-up frame
-    sm, smp = summarise_ms(lat.get("sam3", []))
+    sm, _ = summarise_ms(lat.get("sam3", []))
     dm, dmp = summarise_ms(lat.get("det", [])[1:])
-    return {
+    row = {
         "n_frames": n,
-        "pose_triggered": int(pose_trig),
-        "pose_first_trigger_s": first_t,
-        "n_sam3_calls": len(sam3_scores),
-        "sam3_max_score": round(max(sam3_scores), 4) if sam3_scores else 0.0,
+        "min_ratio": round(best[0], 4) if best else "",
+        "best_frame_s": round(best[1], 2) if best else "",
+        "n_sam3_calls": calls,
+        "sam3_score": round(sam3_score, 4),
         "det_max_conf": round(det_max, 4),
         "det_frames_hit": det_hits,
         "stage1_ms_mean": round(s1, 2), "stage1_ms_p95": round(s1p, 2),
-        "sam3_ms_mean": round(sm, 2), "sam3_ms_p95": round(smp, 2),
+        "sam3_ms_mean": round(sm, 2),
         "det_ms_mean": round(dm, 2), "det_ms_p95": round(dmp, 2),
     }
+    return row, seqs
 
 
 def main():
@@ -100,9 +100,6 @@ def main():
     ap.add_argument("--detector", default="models/cigarette_yolo26n_ge2340.pt")
     ap.add_argument("--sam3", default="models/sam3.pt", help="'' to skip SAM 3")
     ap.add_argument("--stride", type=int, default=5)
-    ap.add_argument("--sustain", type=int, default=9)
-    ap.add_argument("--dist-thr", type=float, default=0.14)
-    ap.add_argument("--max-sam3-calls", type=int, default=3)
     ap.add_argument("--device", default=0)
     ap.add_argument("--save-crops", action="store_true")
     args = ap.parse_args()
@@ -111,8 +108,7 @@ def main():
         rows = [r for r in csv.DictReader(f) if r.get("file")]
 
     print(f"{len(rows)} clips in {args.labels}; loading models...", flush=True)
-    pose = PoseScreener(args.pose, dist_thr=args.dist_thr, sustain=args.sustain,
-                        device=args.device)
+    pose = PoseScreener(args.pose, device=args.device)
     detector = YOLO(args.detector) if args.detector else None
     sam3 = None
     if args.sam3:
@@ -120,12 +116,14 @@ def main():
         sam3 = Sam3Verifier(args.sam3, prompt="cigarette")
     print("Models loaded. Processing clips...", flush=True)
 
+    out_dir = Path(args.out).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
     crop_dir = None
     if args.save_crops:
-        crop_dir = Path(args.out).parent / "crops"
+        crop_dir = out_dir / "crops"
         crop_dir.mkdir(parents=True, exist_ok=True)
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    all_seqs = {}
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
         w.writeheader()
@@ -135,16 +133,18 @@ def main():
                 print(f"[skip] missing {path}", flush=True)
                 continue
             t0 = time.time()
-            res = evaluate_clip(path, pose, sam3, detector, args, crop_dir)
+            res, seqs = evaluate_clip(path, pose, sam3, detector, args, crop_dir)
+            all_seqs[row["file"]] = seqs
             out = {k: row.get(k, "") for k in ("file", "person", "gesture", "distance",
                                                 "is_smoking", "split")}
             out.update(res)
             w.writerow(out)
             f.flush()
-            print(f"[{i}/{len(rows)}] {row['file']}: pose={res['pose_triggered']} "
-                  f"sam3={res['sam3_max_score']:.2f} det={res['det_max_conf']:.2f} "
+            print(f"[{i}/{len(rows)}] {row['file']}: min_ratio={res['min_ratio']} "
+                  f"sam3={res['sam3_score']:.2f} det={res['det_max_conf']:.2f} "
                   f"({time.time() - t0:.1f}s)", flush=True)
-    print(f"Saved {args.out}")
+    (out_dir / "pose_seqs.json").write_text(json.dumps(all_seqs))
+    print(f"Saved {args.out} and {out_dir / 'pose_seqs.json'}", flush=True)
 
 
 if __name__ == "__main__":

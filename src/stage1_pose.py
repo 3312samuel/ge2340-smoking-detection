@@ -1,84 +1,94 @@
-"""Stage 1: YOLO pose screening for hand-to-mouth gestures.
+"""Stage 1: YOLO26 pose screening for hand-to-mouth gestures.
 
-Rule:
-  * nose-to-wrist distance in normalised image coordinates < DIST_THR (0.14)
-  * the wrist must be at or above shoulder height (+0.05 tolerance)
-  * the condition must hold for SUSTAIN consecutive inference frames (9)
-Keypoints come from the official YOLO26 pose weights; low-confidence keypoints
-(< kpt_conf) are ignored.
+Scale-invariant rule (works for people near to and far from the camera):
+
+    ratio = min over wrists ||nose - wrist|| / ||nose - shoulder midpoint||
+
+computed in pixels. ratio < RATIO_THR means a hand is at the face. The
+denominator (roughly neck length) shrinks and grows with the person, so the
+same threshold works at 1.5 m and at 5 m. A wrist only counts if it is above
+shoulder height. A person is flagged when ratio stays below the threshold for
+SUSTAIN_S seconds (a quick touch of the face is ignored).
+
+An earlier version used the raw nose-wrist distance in normalised image
+coordinates (< 0.14). That only works when people appear small (wide CCTV
+views); in our close-up clips it never fired, so it was replaced.
+
+RATIO_THR is chosen on the dev clips (analyze.py --freeze); SUSTAIN_S is fixed
+at 1.0 s in advance.
 """
 import numpy as np
-from ultralytics import YOLO
 
 NOSE, L_SHOULDER, R_SHOULDER, L_WRIST, R_WRIST = 0, 5, 6, 9, 10
 
 
-def hand_to_mouth(kxyn, kconf, dist_thr=0.14, kpt_conf=0.5, shoulder_tol=0.05):
-    """Return (is_suspicious, min_distance) for one person's 17 COCO keypoints.
+def mouth_ratio(kxy, kconf, kpt_conf=0.5, wrist_conf=0.3):
+    """Hand-to-mouth ratio for one person, or None if it cannot be computed.
 
-    kxyn: (17, 2) normalised xy; kconf: (17,) keypoint confidences.
+    kxy: (17, 2) pixel coordinates; kconf: (17,) keypoint confidences.
+    Wrists use a lower confidence bar because a hand at the face is often
+    partly occluded (by a bottle, phone, or the face itself).
     """
     if kconf[NOSE] < kpt_conf:
-        return False, float("inf")
-    nose = kxyn[NOSE]
+        return None
+    nose = kxy[NOSE]
+    shoulders = [kxy[s] for s in (L_SHOULDER, R_SHOULDER) if kconf[s] >= kpt_conf]
+    if not shoulders:
+        return None
+    mid = np.mean(shoulders, axis=0)
+    scale = float(np.linalg.norm(nose - mid))
+    if scale < 1e-3:
+        return None
+    height_limit = mid[1] + 0.25 * scale  # wrist must be above (roughly) shoulder height
+    best = None
+    for w in (L_WRIST, R_WRIST):
+        if kconf[w] >= wrist_conf and kxy[w, 1] < height_limit:
+            r = float(np.linalg.norm(nose - kxy[w])) / scale
+            best = r if best is None else min(best, r)
+    return best
 
-    shoulder_y = 1.0  # unknown shoulders -> no height restriction
-    if kconf[L_SHOULDER] >= kpt_conf and kconf[R_SHOULDER] >= kpt_conf:
-        shoulder_y = (kxyn[L_SHOULDER, 1] + kxyn[R_SHOULDER, 1]) / 2.0
-    height_limit = shoulder_y + shoulder_tol
 
-    best = float("inf")
-    for wrist in (L_WRIST, R_WRIST):
-        if kconf[wrist] >= kpt_conf and kxyn[wrist, 1] < height_limit:
-            best = min(best, float(np.linalg.norm(nose - kxyn[wrist])))
-    return best < dist_thr, best
+def sustained(samples, thr, sustain_s=1.0):
+    """samples: list of (sample_index, time_s, ratio or None) for ONE track,
+    in order. True if ratio < thr holds over consecutive samples for >= sustain_s."""
+    start, prev_idx = None, None
+    for idx, t, r in samples:
+        if r is None or r >= thr:
+            start, prev_idx = None, None
+            continue
+        if start is None or prev_idx != idx - 1:
+            start = t  # a new run begins
+        prev_idx = idx
+        if t - start >= sustain_s:
+            return True
+    return False
 
 
 class PoseScreener:
-    def __init__(self, weights="yolo26n-pose.pt", dist_thr=0.14, sustain=9,
-                 det_conf=0.5, kpt_conf=0.5, imgsz=640, device=None):
+    def __init__(self, weights="yolo26n-pose.pt", det_conf=0.5, kpt_conf=0.5,
+                 imgsz=640, device=None):
         self.weights = weights
-        self.dist_thr, self.sustain = dist_thr, sustain
         self.det_conf, self.kpt_conf = det_conf, kpt_conf
         self.imgsz, self.device = imgsz, device
         self.reset()
 
     def reset(self):
-        """Call before each new clip: fresh tracker state and counters."""
+        """Call before each new clip: fresh tracker state."""
+        from ultralytics import YOLO  # imported here so analyze.py runs without it
         self.model = YOLO(self.weights)
-        self.counters = {}
 
     def step(self, frame):
-        """Process one frame. Returns a list of per-person dicts."""
+        """Process one frame. Returns [{track_id, box, ratio}] for each person."""
         res = self.model.track(frame, persist=True, conf=self.det_conf,
                                imgsz=self.imgsz, device=self.device,
                                tracker="bytetrack.yaml", verbose=False)[0]
-        people = []
         if res.boxes is None or res.boxes.id is None or res.keypoints is None:
-            self.counters.clear()
-            return people
-
+            return []
         ids = res.boxes.id.int().cpu().tolist()
         boxes = res.boxes.xyxy.cpu().numpy()
-        kxyn = res.keypoints.xyn.cpu().numpy()
+        kxy = res.keypoints.xy.cpu().numpy()
         kconf = (res.keypoints.conf.cpu().numpy() if res.keypoints.conf is not None
-                 else np.ones(kxyn.shape[:2]))
-
-        seen = set()
-        for i, tid in enumerate(ids):
-            seen.add(tid)
-            sus, dist = hand_to_mouth(kxyn[i], kconf[i], self.dist_thr, self.kpt_conf)
-            count = self.counters.get(tid, 0) + 1 if sus else 0
-            self.counters[tid] = count
-            people.append({
-                "track_id": tid,
-                "box": boxes[i],
-                "suspicious": sus,
-                "dist": dist,
-                "count": count,
-                "triggered": count >= self.sustain,
-            })
-        for tid in list(self.counters):
-            if tid not in seen:
-                del self.counters[tid]
-        return people
+                 else np.ones(kxy.shape[:2]))
+        return [{"track_id": tid, "box": boxes[i],
+                 "ratio": mouth_ratio(kxy[i], kconf[i], self.kpt_conf)}
+                for i, tid in enumerate(ids)]
